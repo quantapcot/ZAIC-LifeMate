@@ -1,0 +1,37 @@
+# LifeMate local artifacts
+/train/*
+!/train/.gitkeep
+/public_test/*
+!/public_test/.gitkeep
+
+/models/pretrained/*
+!/models/pretrained/.gitkeep
+/models/checkpoints/*
+!/models/checkpoints/.gitkeep
+
+/outputs/*
+!/outputs/benchmarks/
+/outputs/benchmarks/*
+!/outputs/benchmarks/.gitkeep
+
+# Model weights and submissions
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+*.bin
+/submission*
+/submissions/
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
