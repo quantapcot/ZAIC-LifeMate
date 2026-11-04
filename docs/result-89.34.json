@@ -1,0 +1,20 @@
+{
+  "artifact": "result.jsonl",
+  "reported_public_score_100": 89.34,
+  "score_source": "user_reported_in_chat",
+  "official_score_independently_verified": false,
+  "samples": 634,
+  "tool_calls": 1576,
+  "sha256": "4c081afc0829b88126920273dd79ee1833b470a9eed726c30a2dbca20ba9e44d",
+  "provenance": "Archived API v8 result; individual public actions were planned by the OpenAI Codex assistant.",
+  "autonomous_offline_slm_submission": false,
+  "competition_eligibility_confirmed": false,
+  "validation": {
+    "utf8_jsonl": true,
+    "exact_fields": true,
+    "complete_original_id_order": true,
+    "unique_ids": 634,
+    "state_hash_format": "lowercase hexadecimal SHA-256"
+  },
+  "publication_note": "Historical output only; score does not establish competition eligibility. No public ToolEnv was recreated or replayed to prepare this pull request."
+}
