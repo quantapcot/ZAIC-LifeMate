@@ -1,18 +1,18 @@
-# LifeMate local artifacts
+# Dữ liệu do Ban tổ chức cung cấp: giữ local, tuyệt đối không commit
 /train/*
 !/train/.gitkeep
 /public_test/*
 !/public_test/.gitkeep
 
+# Model tải về và checkpoint sinh ra khi train
 /models/pretrained/*
 !/models/pretrained/.gitkeep
 /models/checkpoints/*
 !/models/checkpoints/.gitkeep
 
+# Transcript, session và submission tạm sinh ra khi chạy pipeline
 /outputs/*
 !/outputs/benchmarks/
-/outputs/benchmarks/*
-!/outputs/benchmarks/.gitkeep
 
 # Model weights and submissions
 *.pt
@@ -30,6 +30,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.DS_Store
 
 # Local secrets
 .env
