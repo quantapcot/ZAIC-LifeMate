@@ -1,0 +1,6 @@
+# Install in a separate environment with a CUDA-enabled PyTorch already installed.
+transformers==5.17.0
+huggingface-hub==1.33.0
+numpy==2.4.6
+scipy==1.17.1
+soundfile==0.14.0
