@@ -23,15 +23,27 @@
 *.bin
 /submission*
 /submissions/
+*.wav
+zaic_tools/
+state.json
+/predictions*
 
 # Python environments and caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-asr/
+.conda/
 venv/
 
 # Local secrets
 .env
 .env.*
 !.env.example
+
+# Local competition package and metadata
+/docs/dataset/
+/train+public_test/
+.DS_Store
+*.log
