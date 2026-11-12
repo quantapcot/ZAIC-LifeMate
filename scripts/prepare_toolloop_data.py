@@ -5,70 +5,20 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
-import random
-import re
-import unicodedata
+import os
+import shutil
+import tempfile
 
 from src.toolcall.data import ToolRegistry
+from src.toolcall.data.dataset import load_records
+from src.toolcall.data.split import query_key, make_splits
+from src.toolcall.data.leakage import leakage_audit
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_TRAIN = ROOT / "train"
 DEFAULT_TRAIN = LOCAL_TRAIN if (LOCAL_TRAIN / "train.jsonl").is_file() else ROOT.parent.parent / "train"
 OUTPUT = ROOT / "outputs" / "toolloop"
 
-
-def query_key(text):
-    text = unicodedata.normalize("NFC", text).casefold()
-    return " ".join("".join(" " if unicodedata.category(c).startswith(("P", "S")) else c for c in text).split())
-
-
-def load_records(path):
-    records = []
-    ids = set()
-    with Path(path).open(encoding="utf-8") as stream:
-        for number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid JSON at line {number}") from exc
-            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] or not isinstance(row.get("audio_text"), str) or not isinstance(row.get("label"), dict) or not isinstance(row["label"].get("tool_calls"), list):
-                raise ValueError(f"missing or malformed required fields at line {number}")
-            if row["id"] in ids:
-                raise ValueError(f"duplicate record ID at line {number}")
-            ids.add(row["id"])
-            records.append(row)
-    if not records:
-        raise ValueError("empty dataset")
-    return records
-
-
-def make_splits(records, seed=42):
-    groups = defaultdict(list)
-    for row in records:
-        q = query_key(row["audio_text"])
-        groups[q if q else f"\0{row['id']}"] .append(row)
-    # Large groups first. Seeded tie-breaking, independent of input order.
-    rng = random.Random(seed)
-    group_list = [sorted(g, key=lambda r: r["id"]) for _, g in sorted(groups.items())]
-    rng.shuffle(group_list)
-    group_list.sort(key=len, reverse=True)
-    fractions = {"train": .8, "val": .1, "test": .1}
-    outputs = {key: [] for key in fractions}
-    category_total = Counter(min(len(r["label"]["tool_calls"]), 2) for r in records)
-    category_counts = {key: Counter() for key in fractions}
-    for group in group_list:
-        categories = Counter(min(len(r["label"]["tool_calls"]), 2) for r in group)
-        def cost(key):
-            # Normalized change in squared size and scenario deviations.
-            def delta(current, increment, target):
-                return ((current + increment - target) ** 2 - (current - target) ** 2) / max(target, 1)
-            return delta(len(outputs[key]), len(group), fractions[key] * len(records)) + sum(delta(category_counts[key][c], n, fractions[key] * category_total[c]) for c, n in categories.items())
-        chosen = min(fractions, key=cost)
-        outputs[chosen].extend(r["id"] for r in group)
-        category_counts[chosen].update(categories)
-    return {key: sorted(value) for key, value in outputs.items()}
 
 
 def audit(records, registry):
@@ -126,24 +76,72 @@ def audit(records, registry):
             "optional_argument_count": sum(len(t["parameters"]["properties"]) - len(t["parameters"]["required"]) for t in all_tools)}
 
 
+def _publish_directory(source, target):
+    """Atomically publish without replacing an existing destination; fail closed."""
+    if os.name == "nt":
+        os.rename(source, target)  # Windows rename refuses an existing destination.
+        return
+    if os.name == "posix":
+        import ctypes
+        import errno
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise OSError("atomic no-replace directory rename is unavailable")
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise FileExistsError(error, os.strerror(error), str(target))
+            raise OSError(error, os.strerror(error), str(target))
+        return
+    raise OSError("atomic no-replace directory rename is unavailable")
+
+
 def prepare(records, registry, input_path, catalog_path, output=OUTPUT):
     output = Path(output).resolve()
     # Outputs must stay within this worktree, and may not overwrite existing files.
-    if not output.is_relative_to((ROOT / "outputs" / "toolloop").resolve()):
+    allowed = ROOT / "outputs" / "toolloop"
+    if allowed.resolve() != allowed or not output.is_relative_to(allowed):
         raise ValueError("output must be within outputs/toolloop")
     if any(output == Path(p).resolve() or Path(p).resolve().is_relative_to(output) or output.is_relative_to(Path(p).resolve().parent) for p in (input_path, catalog_path)):
         raise ValueError("output overlaps an input")
+    input_hash = hashlib.sha256(Path(input_path).read_bytes()).hexdigest()
+    catalog_hash = hashlib.sha256(Path(catalog_path).read_bytes()).hexdigest()
+    actual_registry = ToolRegistry.from_catalog(catalog_path)
+    verified_records = load_records(input_path, actual_registry)
+    if verified_records != records or actual_registry.list_tools() != registry.list_tools() or actual_registry.version != registry.version or any(actual_registry.get_tool(n) != registry.get_tool(n) for n in registry.list_tools()):
+        raise ValueError("provided data does not match input files")
     splits = make_splits(records)
     stats = audit(records, registry)
     if stats["unknown_tool_names"]:
         raise ValueError("dataset contains tool names absent from catalog")
-    manifest = {"seed": 42, "strategy": "NFC/casefold/punctuation-whitespace grouped; size and call-count stratified", "counts": {k:len(v) for k,v in splits.items()}, "dataset_sha256": hashlib.sha256(Path(input_path).read_bytes()).hexdigest(), "catalog_sha256": hashlib.sha256(Path(catalog_path).read_bytes()).hexdigest(), "catalog_version": registry.version}
-    output.mkdir(parents=True, exist_ok=False)
-    (output / "splits").mkdir()
-    for key, ids in splits.items():
-        (output / "splits" / f"{key}_ids.json").write_text(json.dumps(ids, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (output / "splits" / "split_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    (output / "audit.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    manifest = {"seed": 42, "strategy": "NFC/casefold/punctuation-whitespace grouped; size and call-count stratified", "counts": {k:len(v) for k,v in splits.items()}, "dataset_sha256": input_hash, "catalog_sha256": catalog_hash, "catalog_version": registry.version}
+    if output.exists():
+        raise FileExistsError("preparation output already exists")
+    # Stage in a unique sibling under the ignored output area, then publish in one rename.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".toolloop-preparing-", dir=output.parent))
+    try:
+        (temporary / "splits").mkdir()
+        payloads = {f"splits/{key}_ids.json": ids for key, ids in splits.items()}
+        payloads["splits/split_manifest.json"] = manifest
+        stats["leakage"] = leakage_audit(records, splits)
+        payloads["audit.json"] = stats
+        for relative, value in payloads.items():
+            path = temporary / relative
+            path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            if json.loads(path.read_text(encoding="utf-8")) != value:
+                raise ValueError("output verification failed")
+        if hashlib.sha256(Path(input_path).read_bytes()).hexdigest() != input_hash or hashlib.sha256(Path(catalog_path).read_bytes()).hexdigest() != catalog_hash:
+            raise ValueError("inputs changed during preparation")
+        if output.exists():
+            raise FileExistsError("preparation output already exists")
+        _publish_directory(temporary, output)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
     return manifest
 
 
@@ -153,18 +151,20 @@ def main():
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--prepare", action="store_true")
     parser.add_argument("--train-dir", type=Path, default=DEFAULT_TRAIN)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT, help="new output directory under outputs/toolloop")
     args = parser.parse_args()
     dataset, catalog = args.train_dir / "train.jsonl", args.train_dir / "train_tools_catalog.json"
     registry = ToolRegistry.from_catalog(catalog)
-    records = load_records(dataset)
+    records = load_records(dataset, registry)
     stats = audit(records, registry)
     splits = make_splits(records)
+    stats["leakage"] = leakage_audit(records, splits)
     print(json.dumps({"audit": stats, "planned_split_counts": {k:len(v) for k,v in splits.items()}, "seed": 42}, indent=2, ensure_ascii=True))
     if stats["unknown_tool_names"]:
         raise ValueError("dataset contains tool names absent from catalog")
     if args.prepare:
-        prepare(records, registry, dataset, catalog)
-        print("Local outputs created in outputs/toolloop (ignored by Git).")
+        prepare(records, registry, dataset, catalog, args.output_dir)
+        print("Local outputs created in the selected ignored output directory.")
 
 
 if __name__ == "__main__":

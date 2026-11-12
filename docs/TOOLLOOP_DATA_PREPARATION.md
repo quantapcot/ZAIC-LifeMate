@@ -2,7 +2,7 @@
 
 ## Repository and scope
 
-Work is isolated in `.worktrees/toolloop-synthesis` on `feature/toolloop-synthesis`, based on the locally available `origin/main` (`fe7f368`). The original `feature/asr-chunkformer-vie` worktree has a pending merge and staged work and was not switched or modified. The new worktree does not contain the uncommitted ChunkFormer changes. No commits, pushes, model downloads, ToolEnv calls, LLM generation or fine-tuning were performed.
+Work is isolated in `.worktrees/toolloop-synthesis` on `feature/toolloop-synthesis`, based on the locally available `origin/main` (`fe7f368`). At initial Phase 1 preparation, the original `feature/asr-chunkformer-vie` worktree had a pending merge and staged work; this hardening task did not switch or modify it. The new worktree does not contain the uncommitted ChunkFormer changes. No commits, pushes, model downloads, ToolEnv calls, LLM generation or fine-tuning were performed.
 
 Inputs inspected read-only from the original workspace: `train/train.jsonl`, `train/train_tools_catalog.json`, `train/zaic_tools/README.md`, `train/zaic_tools/validate.py`, `train/zaic_tools/executor.py`, and the SDK tool registry; project README and existing benchmark/test conventions were also inspected. No environment state files or public-test labels were read. The local worktree automatically finds the sibling original `train/`; `--train-dir` can explicitly select a local train directory. The [ToolLoop paper](https://aclanthology.org/2026.emnlp-main.1262/) describes three stages and dynamic feedback; this phase defines interfaces only.
 
@@ -24,7 +24,7 @@ Catalog names and kind annotations matched the SDK's `TOOLS` registry (147 on ea
 
 Seed 42; records are grouped by normalized query, with nonempty duplicates kept together. Seeded tie ordering and a deterministic size/scenario allocation minimize deviations from 80/10/10 and zero/one/multiple call proportions. Input order does not affect the result. Local results: train 1,236 (89 zero, 295 one, 852 multiple); validation 155 (11, 37, 107); test 154 (11, 37, 106). All IDs are unique and pairwise intersections of IDs and normalized queries are zero. The generated manifest records input and catalog SHA-256 and schema version; recomputation matched both source files after preparation.
 
-Exact grouping does not prevent paraphrase, shared history, entity, template or state leakage; these need a stronger reviewed grouping strategy before treating the internal test as a robust held-out estimate. `outputs/toolloop/` is ignored and contains IDs, the manifest and aggregate audit, not copied records. No synthesis code exists in this phase. The future generator must accept only train IDs and a train-only view, and must not be passed validation/test IDs or records; OS-level access control is not provided, so isolation requires enforcement and tests in Phase 2. Do not use official public test as training data.
+Exact grouping does not prevent paraphrase, shared history, entity, template or state leakage; these need a stronger reviewed grouping strategy before treating the internal test as a robust held-out estimate. `outputs/toolloop/` is ignored and contains IDs, the manifest and aggregate audit, not copied records. No synthesis code exists in this phase. The train-only accessor now provides a checked train-only view; future generators must use it and must not be passed validation/test IDs or records. It is not an OS-level security boundary. Do not use official public test as training data.
 
 ## Contracts and future integration
 
@@ -49,4 +49,38 @@ Created `src/toolcall/data/{__init__,schema_registry,contracts}.py`, `src/toolca
 
 ## Phase 2 readiness and risks
 
-The sampler needs a train-only data access boundary and representative tool/scenario selection. The backward generator needs controlled context, Vietnamese quality checks and no private data transmission without authorization. The forward generator needs the official schema and sample-installed tools; the verifier needs SDK-compatible deterministic checks plus semantic checks, explicit retry limits and audit history. Stateful trajectories require a separately reviewed execution policy and provenance. Fuzzy leakage, reliable dependency/parallel labels, stronger input validation, semantic constraints and a genuinely isolated held-out evaluation remain open; Phase 1 does not claim to solve them.
+The sampler needs to use the train-only data access boundary and select representative tools and scenarios. The backward generator needs controlled context, Vietnamese quality checks and no private data transmission without authorization. The forward generator needs the official schema and sample-installed tools; the verifier needs SDK-compatible deterministic checks plus semantic checks, explicit retry limits and audit history. Stateful trajectories require a separately reviewed execution policy and provenance. Fuzzy leakage, reliable dependency/parallel labels, stronger input validation, semantic constraints and a genuinely isolated held-out evaluation remain open; Phase 1 does not claim to solve them.
+
+
+## Phase 1 Hardening ? Final Review
+
+The original preparation did not provide a train-only accessor, performed only partial dataset and catalog validation, did not identify cross-split similarities, and could leave a partial-looking output after failure. Hardening addresses these points without changing the split algorithm or official tool schemas.
+
+`TrainOnlyDataset.from_prepared_split` checks both input SHA-256 hashes, catalog version, valid ID lists and counts, uniqueness and pairwise disjointness, complete dataset coverage, seed/strategy, and exact deterministic split assignments. It validates the dataset against the catalog, checks the source hashes again after reading, retains only training records and returns copies. Its public `get` rejects validation, test and unknown IDs; its iterator returns only training records. Missing or corrupt metadata fails closed. The hashes and deterministic assignment checks detect accidental inconsistency, not malicious coordinated tampering, and this Python API cannot prevent direct file reads or introspection. For a future sampler:
+
+```python
+from pathlib import Path
+from src.toolcall.data import TrainOnlyDataset
+
+train_data = TrainOnlyDataset.from_prepared_split(
+    train_path=Path("../../train/train.jsonl"),
+    catalog_path=Path("../../train/train_tools_catalog.json"),
+    splits_dir=Path("outputs/toolloop/splits"),
+)
+for record in train_data.iter_records():
+    pass  # consume training records only
+```
+
+Preparation now validates required audio/text, context, history, label, call/result/final-state types and duplicate IDs, plus unknown tool names in calls. Optional history fields are validated when present. Errors refer to line numbers and fields without printing record contents. Registry checks duplicate app IDs and required names, basic nested schema field types and required-property membership; it preserves custom constraints and does not claim full JSON Schema compliance. The SDK and split catalog remain the runtime reference; a future stricter synthetic-data validator may reject unknown arguments even though the SDK currently ignores them.
+
+The leakage audit examines cross-split pairs sharing a token: exact normalized query matches; equal templates after replacing digit runs; and lexical warnings with token-set Jaccard >= 0.75 and character SequenceMatcher >= 0.88. Counts can overlap; empty/token-disjoint pairs, paraphrases, history and context leakage are not covered. This is not semantic deduplication and does not reassign records. On the local data: **0 exact normalized cross-split pairs, 0 digit-template pairs, 34 lexical warnings**. No text or ID pairs are emitted.
+
+Preparation validates before writing, stages and verifies JSON in a new temporary sibling under ignored `outputs/`, rechecks source hashes, and publishes with an atomic no-replace directory rename. Failure cleans only its own temporary directory; an interrupted process may leave a clearly named `.toolloop-preparing-*` temporary directory, which is not a valid published result. Existing destinations are never intentionally overwritten. Windows and Linux with `renameat2` support are supported; platforms lacking atomic no-replace rename fail closed. To preserve the prior output while preparing another local copy:
+
+```powershell
+python -m scripts.prepare_toolloop_data --prepare --output-dir outputs/toolloop/hardening-20261113
+```
+
+The 2026-11-13 local run again found 1,545 records and 147 tools. Splits remain 1,236/155/154, and every ID matches the prior manifest. Both old and new manifests passed train-only checks; validation and test lookups were rejected, and source dataset and catalog hashes matched. The new output is ignored by Git. Fourteen fixture tests pass on system Python without GPU or network; full discovery in the existing compatible ASR environment passes 15 tests, including the existing ASR helper. System Python still lacks the optional NumPy dependency needed by that unrelated pre-existing test.
+
+The data foundation is ready for a controlled Ground Truth Sampler using the accessor. Backward/forward generation still requires implementation and evaluation of semantic validation, Vietnamese quality, provenance, stateful execution policy and the 34 lexical warnings; no generation has been run. The access API is not a sandbox and does not establish an unbiased held-out set.
