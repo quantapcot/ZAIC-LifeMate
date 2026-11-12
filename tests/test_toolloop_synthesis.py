@@ -152,7 +152,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d).resolve(); base=root/'synthesis'
             with patch('scripts.synthesize_toolcalls.SYNTHESIS_ROOT',base):
-                path=base/'run';write_run(path,[],{})
+                path=base/'run';write_run(path,[],{'outcome':'completed'})
                 with self.assertRaises(FileExistsError):write_run(path,[],{})
                 with self.assertRaises(ValueError):write_run(root/'outside',[],{})
                 self.assertTrue((path/'COMPLETE').is_file())

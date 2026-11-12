@@ -1,6 +1,14 @@
 ﻿"""Sample only single-call targets from the verified training view."""
 import random
 from src.toolcall.data.contracts import GroundTruth, Metadata
+from .schema_inspection import unsupported_constraints
+
+
+class UnsupportedSchema(ValueError):
+    def __init__(self, tool_name, issues):
+        self.tool_name = tool_name
+        self.issues = issues
+        super().__init__(issues[0]['code'])
 
 
 def sample(record, registry, scenario, seed):
@@ -14,9 +22,9 @@ def sample(record, registry, scenario, seed):
     if target not in registry.list_tools() or target not in allowed or target.startswith('sys.'):
         raise ValueError('unsupported_target')
     schema=registry.get_schema(target)
-    # State-derived identifiers and conditional argument alternatives need later trajectory verification.
-    if schema.get('x-one-of') or any(any(k in spec for k in ('x-ref','x-match')) for spec in schema['properties'].values()):
-        raise ValueError('state_dependent_target')
+    issues = unsupported_constraints(schema)
+    if issues:
+        raise UnsupportedSchema(target, issues)
     candidates=[target]
     if scenario == 'multiple':
         app=target.split('.',1)[0]

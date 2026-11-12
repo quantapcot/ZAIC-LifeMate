@@ -1,13 +1,15 @@
-﻿"""Conservative deterministic checks; semantic correctness remains unverified."""
+"""Conservative deterministic checks; semantic correctness remains unverified."""
 import math
 from src.toolcall.data.contracts import VerificationFeedback
+from .errors import issue
 
 
 def feedback(stage, issues, unverified=()):
-    return VerificationFeedback(stage=stage, valid=not issues, status='provisional' if not issues else 'rejected',
+    normalized = [item if isinstance(item, dict) else issue(item[1], item[0], retryable=not item[1].startswith('unsupported')) for item in issues]
+    return VerificationFeedback(stage=stage, valid=not normalized, status='provisional' if not normalized else 'rejected',
         checks=[{'name': name, 'status':'not_verified'} for name in unverified],
-        issues=[{'field': field, 'reason': reason} for field, reason in issues], retry_count=0, max_retries=0,
-        failure_reasons=sorted({reason for _, reason in issues}))
+        issues=normalized, retry_count=0, max_retries=0,
+        failure_reasons=sorted({item['error_code'] for item in normalized}))
 
 
 def validate_ground(ground, registry):
@@ -35,17 +37,17 @@ def _schema(value, schema, path, issues, unverified):
     checks = {'object': lambda x:isinstance(x, dict), 'array':lambda x:isinstance(x, list), 'string':lambda x:isinstance(x, str), 'integer':lambda x:type(x) is int, 'number':lambda x:type(x) in (int,float) and math.isfinite(x), 'boolean':lambda x:type(x) is bool, 'null':lambda x:x is None}
     types = typ if isinstance(typ, list) else [typ]
     if typ is not None and (any(t not in checks for t in types) or not any(checks[t](value) for t in types)):
-        issues.append((path,'invalid_type')); return
+        issues.append(issue('INVALID_ARGUMENT_TYPE', path, message='Expected ' + str(typ) + '; received ' + type(value).__name__ + '.')); return
     if 'enum' in schema and not any(type(value) is type(x) and value == x for x in schema['enum']): issues.append((path,'invalid_enum'))
     if type(value) in (int,float):
         for op in ('minimum','maximum','exclusiveMinimum','exclusiveMaximum'):
             if op in schema and not {'minimum':lambda a,b:a>=b,'maximum':lambda a,b:a<=b,'exclusiveMinimum':lambda a,b:a>b,'exclusiveMaximum':lambda a,b:a<b}[op](value,schema[op]): issues.append((path,'invalid_range'))
     if isinstance(value,dict):
         props = schema.get('properties', {})
-        for key in value.keys() - props.keys(): issues.append((path+'.'+key,'unexpected_argument'))
+        for key in sorted(value.keys() - props.keys()): issues.append((path+'.'+key,'unexpected_argument'))
         for key in schema.get('required', []):
             if key not in value or value[key] is None or value[key] == '' or value[key] == [] or value[key] == {}: issues.append((path+'.'+key,'missing_required'))
-        for key in value.keys() & props.keys(): _schema(value[key], props[key], path+'.'+key, issues, unverified)
+        for key in sorted(value.keys() & props.keys()): _schema(value[key], props[key], path+'.'+key, issues, unverified)
         groups=schema.get('x-one-of', [])
         if groups and not any(all(k in value and value[k] not in (None,'',[],{}) for k in group) for group in groups): issues.append((path,'x_one_of_unsatisfied'))
     if isinstance(value,list) and isinstance(schema.get('items'),dict):
@@ -64,8 +66,8 @@ def validate_calls(raw, ground, registry):
         if not isinstance(call,dict) or set(call) != {'name','arguments'} or not isinstance(call.get('name'),str) or not isinstance(call.get('arguments'),dict):
             issues.append((f'tool_calls[{idx}]','invalid_structure'));continue
         name=call['name']
-        if name not in ground.candidate_tools: issues.append((f'tool_calls[{idx}]','not_candidate'));continue
-        if name not in registry.list_tools(): issues.append((f'tool_calls[{idx}]','unknown_tool'));continue
+        if name not in registry.list_tools(): issues.append((f'tool_calls[{idx}].name','unknown_tool'));continue
+        if name not in ground.candidate_tools: issues.append((f'tool_calls[{idx}].name','not_candidate'));continue
         _schema(call['arguments'],registry.get_schema(name),f'tool_calls[{idx}].arguments',issues,unverified)
     if [c.get('name') if isinstance(c,dict) else None for c in calls] != ground.target_tools: issues.append(('tool_calls','target_mismatch'))
     return feedback(3, issues, sorted(unverified))

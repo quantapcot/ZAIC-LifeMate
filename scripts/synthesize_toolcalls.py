@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import statistics
 import sys
+import os
 from src.toolcall.data import ToolRegistry, TrainOnlyDataset
 from src.toolcall.llm import OllamaClient, TransportError, InvalidModelOutput
 from src.toolcall.synthesis.pipeline import generate
 from src.toolcall.synthesis import sampler
+from src.toolcall.synthesis.schema_inspection import catalog_eligibility
 from scripts.prepare_toolloop_data import DEFAULT_TRAIN, OUTPUT
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,13 +44,24 @@ def summarize(records, client, seed, requested):
     return stats
 
 
+def run_outcome(records, selection):
+    if not records or any(r['failure_reason']=='TransportError' for r in records):
+        return 'failed'
+    return 'partial' if selection['shortfall'] else 'completed'
+
+
 def write_run(out, records, stats):
     out=output_path(out)
+    if stats.get('outcome') not in ('completed','partial','failed'):
+        raise ValueError('explicit run outcome required')
     out.mkdir(parents=True,exist_ok=False)
     # A missing completion marker makes an interrupted run visibly incomplete.
     for name,obj in [('records.json',records),('summary.json',stats)]:
         with (out/name).open('x',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False,indent=2)
-    (out/'COMPLETE').write_text('provisional\n',encoding='utf-8')
+    marker={'completed':'COMPLETE','partial':'PARTIAL','failed':'FAILED'}[stats['outcome']]
+    temporary=out/'.outcome.tmp'
+    with temporary.open('x',encoding='utf-8') as f: f.write('run outcome only; records are provisional or rejected\n')
+    os.replace(temporary, out/marker)
 
 
 def main():
@@ -71,7 +84,6 @@ def main():
         client=OllamaClient(model=args.model,base_url=args.base_url,seed=args.seed,context_length=args.context_length,max_tokens=args.max_tokens,timeout=args.timeout)
         registry=ToolRegistry.from_catalog(args.train_dir/'train_tools_catalog.json')
         train=TrainOnlyDataset.from_prepared_split(args.train_dir/'train.jsonl',args.train_dir/'train_tools_catalog.json',args.splits_dir)
-        output_path(args.output_dir)
         if args.dry_run:
             eligible = {'simple': 0, 'multiple': 0}
             for record in train.iter_records():
@@ -82,19 +94,22 @@ def main():
                     except ValueError:
                         continue
             if not all(eligible.values()): raise ValueError('no eligible examples for a supported scenario')
-            print(json.dumps({'train_count':len(train),'catalog_tools':len(registry.list_tools()),'eligible':eligible,'unsupported':['parallel','parallel_multiple'],'model':client.model,'output':'available'}));return
+            print(json.dumps({'train_count':len(train),'catalog_tools':len(registry.list_tools()),'eligible':eligible,'catalog_schema_filter':catalog_eligibility(registry),'unsupported':['parallel','parallel_multiple'],'model':client.model}));return
         if args.smoke:
             raw,usage=client.generate_json('Return JSON only.','Return the JSON object {"ok": true}.',{'type':'object','properties':{'ok':{'type':'boolean'}},'required':['ok']})
             if raw != {'ok':True}: raise InvalidModelOutput('smoke output failed validation')
             print(json.dumps({'smoke':'passed','latency_seconds':usage['latency_seconds'],'output_tokens':usage['output_tokens']}));return
-        records=generate(train,registry,client,args.limit,args.seed)
+        output_path(args.output_dir)
+        records,selection=generate(train,registry,client,args.limit,args.seed,with_report=True)
         stats=summarize(records,client,args.seed,args.limit)
+        stats.update(selection)
+        stats['outcome']=run_outcome(records,selection)
         stats['model_digest']=client.model_digest()
         stats['catalog_version']=registry.version
         stats['dataset_sha256']=json.loads((args.splits_dir/'split_manifest.json').read_text(encoding='utf-8'))['dataset_sha256']
         write_run(args.output_dir,records,stats)
         print(json.dumps(stats,ensure_ascii=True,indent=2))
-        if not records or any(r['failure_reason']=='TransportError' for r in records): raise RuntimeError('pilot incomplete: no eligible records or transport failure')
+        if stats['outcome'] != 'completed': raise RuntimeError('pilot outcome: '+stats['outcome'])
     except (ValueError,FileNotFoundError,FileExistsError,TransportError,InvalidModelOutput,RuntimeError) as exc:
         print(f'Error: {type(exc).__name__}: {exc}',file=sys.stderr)
         sys.exit(1)

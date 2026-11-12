@@ -1,40 +1,56 @@
 """Local, non-streaming Ollama chat adapter; never follows redirects or proxies."""
 import json
 import time
+import socket
 from urllib import error, request
 from urllib.parse import urlsplit
 
 MODEL = "qwen3:4b-instruct-2507-q4_K_M"
 
 
-class TransportError(RuntimeError): pass
-class InvalidModelOutput(ValueError): pass
+class TransportError(RuntimeError):
+    def __init__(self, message, code="TRANSPORT_FAILURE"):
+        super().__init__(message)
+        self.code = code
+        self.field = "request"
+        self.raw_output = None
+
+
+class InvalidModelOutput(ValueError):
+    def __init__(self, message, code="OUTPUT_SCHEMA_MISMATCH", field="response", raw_output=None):
+        super().__init__(message)
+        self.code = code
+        self.field = field
+        self.raw_output = raw_output
+
 
 
 def _reject_constant(value):
     raise ValueError("invalid JSON constant")
 
 
-def _check_output(value, schema):
+def _check_output(value, schema, path="$"):
     """Validate the JSON-schema subset used by our structured response envelopes."""
     kind = schema.get("type")
     predicates = {"object": lambda x: isinstance(x, dict), "array": lambda x: isinstance(x, list),
                   "string": lambda x: isinstance(x, str), "boolean": lambda x: type(x) is bool,
                   "integer": lambda x: type(x) is int, "number": lambda x: type(x) in (int, float)}
     if kind not in predicates or not predicates[kind](value):
-        raise InvalidModelOutput("structured response has an invalid type")
+        raise InvalidModelOutput("structured response has an invalid type", field=path)
     if isinstance(value, dict):
         properties = schema.get("properties", {})
-        if any(k not in value for k in schema.get("required", [])):
-            raise InvalidModelOutput("structured response is missing a field")
-        if schema.get("additionalProperties") is False and any(k not in properties for k in value):
-            raise InvalidModelOutput("structured response has an unexpected field")
+        missing = [k for k in schema.get("required", []) if k not in value]
+        if missing:
+            raise InvalidModelOutput("structured response is missing a field", field=path + "." + missing[0])
+        extra = sorted(k for k in value if k not in properties) if schema.get("additionalProperties") is False else []
+        if extra:
+            raise InvalidModelOutput("structured response has an unexpected field", field=path + "." + extra[0])
         for key, child in properties.items():
-            if key in value: _check_output(value[key], child)
+            if key in value: _check_output(value[key], child, path + "." + key)
     if isinstance(value, list) and "items" in schema:
-        for child in value: _check_output(child, schema["items"])
+        for i, child in enumerate(value): _check_output(child, schema["items"], f"{path}[{i}]")
     if "enum" in schema and value not in schema["enum"]:
-        raise InvalidModelOutput("structured response violates enum")
+        raise InvalidModelOutput("structured response violates enum", field=path)
 
 
 class NoRedirect(request.HTTPRedirectHandler):
@@ -77,16 +93,25 @@ class OllamaClient:
                 raw = response.read(4 * 1024 * 1024 + 1)
             if len(raw) > 4 * 1024 * 1024: raise InvalidModelOutput("response exceeds limit")
         except (error.URLError, TimeoutError, OSError) as exc:
-            raise TransportError("Ollama request failed or timed out") from exc
+            reason = exc.reason if isinstance(exc, error.URLError) else exc
+            code = "TIMEOUT" if isinstance(reason, (TimeoutError, socket.timeout)) else "TRANSPORT_FAILURE"
+            raise TransportError("Ollama transport failed", code=code) from exc
         elapsed = time.perf_counter() - start
         try:
             envelope = json.loads(raw, parse_constant=_reject_constant)
-            if not isinstance(envelope, dict) or envelope.get('done') is not True or not isinstance(envelope.get('message'), dict): raise ValueError()
+            if not isinstance(envelope, dict) or envelope.get('done') is not True or not isinstance(envelope.get('message'), dict):
+                raise ValueError()
             content = envelope['message'].get('content')
             if not isinstance(content, str): raise ValueError()
-            result = json.loads(content, parse_constant=_reject_constant)
-            if not isinstance(result, dict): raise ValueError()
         except (ValueError, UnicodeDecodeError, TypeError) as exc:
-            raise InvalidModelOutput("malformed response or invalid JSON") from exc
-        _check_output(result, output_schema)
+            raise InvalidModelOutput("malformed response envelope", code="MALFORMED_ENVELOPE", field="response") from exc
+        try:
+            result = json.loads(content, parse_constant=_reject_constant)
+        except (ValueError, TypeError) as exc:
+            raise InvalidModelOutput("model content is invalid JSON", code="INVALID_JSON", field="message.content", raw_output=content[:4096]) from exc
+        try:
+            _check_output(result, output_schema)
+        except InvalidModelOutput as exc:
+            exc.raw_output = content[:4096]
+            raise
         return result, {"latency_seconds": elapsed, "prompt_tokens": envelope.get('prompt_eval_count'), "output_tokens": envelope.get('eval_count'), "model": self.model, "options": dict(self.options)}
