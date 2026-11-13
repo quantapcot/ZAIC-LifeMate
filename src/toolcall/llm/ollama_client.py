@@ -60,7 +60,7 @@ class NoRedirect(request.HTTPRedirectHandler):
 
 class OllamaClient:
     def __init__(self, model=MODEL, base_url="http://127.0.0.1:11434", seed=42,
-                 temperature=0.1, context_length=4096, max_tokens=512, timeout=180):
+                 temperature=0.1, context_length=4096, max_tokens=512, timeout=180, keep_alive=None, think=None):
         url = urlsplit(base_url)
         if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1") or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
             raise ValueError("Ollama URL must be a local HTTP origin")
@@ -70,6 +70,9 @@ class OllamaClient:
         self.model = model
         self.options = {"seed": seed, "temperature": temperature, "num_ctx": context_length, "num_predict": max_tokens}
         self.timeout = timeout
+        self.keep_alive = keep_alive
+        self.think = think
+        self.prompt_byte_limit = None
         self.opener = request.build_opener(request.ProxyHandler({}), NoRedirect())
 
     def model_digest(self):
@@ -83,15 +86,37 @@ class OllamaClient:
             return None
         return None
 
+    def unload(self):
+        """Ask the local Ollama server to unload this exact model."""
+        payload = json.dumps({"model":self.model,"keep_alive":0,"prompt":"","stream":False}).encode("utf-8")
+        req = request.Request(self.base_url + "/api/generate", data=payload, headers={"Content-Type":"application/json"}, method="POST")
+        try:
+            with self.opener.open(req, timeout=self.timeout) as response:
+                response.read(1024 * 1024)
+        except (error.URLError, TimeoutError, OSError) as exc:
+            raise TransportError("Ollama unload failed") from exc
+
     def generate_json(self, system_prompt, user_prompt, output_schema):
         payload = {"model": self.model, "stream": False, "format": output_schema,
                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], "options": self.options}
-        req = request.Request(self.base_url + "/api/chat", data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers={"Content-Type": "application/json"}, method="POST")
+        if self.keep_alive is not None: payload["keep_alive"] = self.keep_alive
+        if self.think is not None: payload["think"] = self.think
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if self.prompt_byte_limit is not None and len(encoded) > self.prompt_byte_limit:
+            raise ValueError("PROMPT_TOO_LARGE")
+        req = request.Request(self.base_url + "/api/chat", data=encoded, headers={"Content-Type": "application/json"}, method="POST")
         start = time.perf_counter()
         try:
             with self.opener.open(req, timeout=self.timeout) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)
-            if len(raw) > 4 * 1024 * 1024: raise InvalidModelOutput("response exceeds limit")
+            if len(raw) > 4 * 1024 * 1024: raise InvalidModelOutput("response exceeds limit", code="RESPONSE_TOO_LARGE")
+        except error.HTTPError as exc:
+            try:
+                detail = exc.read(4096).decode("utf-8", errors="replace").casefold()
+            except OSError:
+                detail = ""
+            code = "OUT_OF_MEMORY" if "out of memory" in detail or "cuda malloc" in detail else "TRANSPORT_FAILURE"
+            raise TransportError("Ollama HTTP request failed", code=code) from exc
         except (error.URLError, TimeoutError, OSError) as exc:
             reason = exc.reason if isinstance(exc, error.URLError) else exc
             code = "TIMEOUT" if isinstance(reason, (TimeoutError, socket.timeout)) else "TRANSPORT_FAILURE"

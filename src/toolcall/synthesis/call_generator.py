@@ -1,4 +1,4 @@
-﻿"""Independently select calls from candidate schemas, without target answers."""
+"""Independently select calls from candidate schemas, without target answers."""
 import json
 from src.toolcall.data.contracts import ForwardCalls, ToolCall, Metadata
 SYSTEM = ('Bạn chọn công cụ phù hợp với câu yêu cầu. Chỉ trả JSON. Chỉ dùng tham số được định nghĩa, '
@@ -7,8 +7,9 @@ SYSTEM = ('Bạn chọn công cụ phù hợp với câu yêu cầu. Chỉ trả
 SCHEMA={'type':'object','properties':{'tool_calls':{'type':'array','items':{'type':'object','properties':{'name':{'type':'string'},'arguments':{'type':'object'}},'required':['name','arguments'],'additionalProperties':False}}},'required':['tool_calls'],'additionalProperties':False}
 
 
-def generate(client, query, candidate_names, registry, dataset_version):
+def generate(client, query, candidate_names, registry, dataset_version, refinement=None):
     payload={'query':query,'candidate_tools':[registry.get_tool(n) for n in candidate_names]}
+    if refinement is not None: payload['refinement'] = refinement
     raw,usage=client.generate_json(SYSTEM,json.dumps(payload,ensure_ascii=False),SCHEMA)
     calls=raw.get('tool_calls')
     result=None

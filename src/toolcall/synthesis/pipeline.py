@@ -8,6 +8,10 @@ from .errors import issue
 from src.toolcall.llm import TransportError, InvalidModelOutput
 from src.toolcall.data.split import query_key
 from src.toolcall.data import TrainOnlyDataset
+from src.toolcall.data.contracts import GroundTruth, Metadata
+from src.toolcall.verification import POLICY_VERSION
+from src.toolcall.verification.semantic_verifier import inspect_verdict
+from .refinement import run_stage
 
 
 def run_attempt(record, registry, client, scenario, seed, training_queries=frozenset()):
@@ -59,7 +63,76 @@ def run_attempt(record, registry, client, scenario, seed, training_queries=froze
     return result
 
 
-def generate(train_data, registry, client, limit, seed, with_report=False):
+
+def run_verified_attempt(record, registry, client, scenario, seed, training_queries, verifier, max_refinements=3, model_metadata=None):
+    if verifier is None: raise ValueError('semantic verifier required')
+    required=('generator','generator_digest','verifier','verifier_digest')
+    if not isinstance(model_metadata,dict) or not all(isinstance(model_metadata.get(k),str) and model_metadata[k] for k in required) or model_metadata['generator_digest']==model_metadata['verifier_digest']:
+        raise ValueError('distinct generator and verifier identities and digests required')
+    result={'status':'rejected','sft_ready':False,'policy_version':POLICY_VERSION,'scenario_type':scenario,
+            'seed':seed,'stages':{},'stage_history':{},'failure_stage':None,'failure_reason':None,'model_metadata':model_metadata}
+    def store(stage, name, phase):
+        result['stage_history'][name]=phase['history']
+        if phase['history']:
+            last=phase['history'][-1]
+            result['stages'][name]={'output':phase['output'], 'validation':last.get('deterministic') or {'valid':False},
+                'latency_seconds':sum(x.get('latency_seconds',0) for x in phase['history']), 'usage':last.get('generation_usage') or {}}
+        if phase['status']!='passed':
+            result['failure_stage']=stage
+            result['failure_reason']='verification_'+phase['status']
+            result['status']=phase['status'] if phase['status']=='manual_review_required' else 'rejected'
+            return False
+        return True
+    def verify_stage(stage, selected_ground, query='', calls=None):
+        decision=verifier.verify(stage,selected_ground,registry,query=query,calls=calls)
+        if not isinstance(decision,dict) or not isinstance(decision.get('verdict'),dict):
+            raise ValueError('MALFORMED_VERDICT')
+        policy_issues=inspect_verdict(stage,decision['verdict'],query,calls,registry)
+        decision=dict(decision)
+        decision['issues']=sorted(set(decision.get('issues',[])) | set(policy_issues))
+        decision['passed']=decision.get('passed') is True and not decision['issues']
+        return decision
+    def make_ground(attempt, instruction):
+        ground=sampler.sample(record,registry,scenario,seed+attempt)
+        return asdict(ground),{'model':'deterministic_sampler','attempt':attempt}
+    def ground_from(raw):
+        return GroundTruth(raw['scenario_type'],raw['candidate_tools'],raw['target_tools'],Metadata(**raw['metadata']))
+    stage1=run_stage(1,make_ground,lambda raw:validators.validate_ground(ground_from(raw),registry),
+                     lambda raw:verify_stage(1,ground_from(raw)),max_refinements)
+    if not store(1,'ground_truth',stage1): return result
+    ground=ground_from(stage1['output'])
+    def make_query(attempt, instruction):
+        raw,_,usage=query_generator.generate(client,ground,registry,refinement=instruction)
+        return raw,usage
+    def check_query(raw):
+        check=validators.validate_query(raw,ground)
+        if check.valid and query_key(raw['user_query']) in training_queries:
+            return validators.feedback(2,[('user_query','copies_training_query')],('semantic_alignment','argument_grounding'))
+        return check
+    stage2=run_stage(2,make_query,check_query,
+                     lambda raw:verify_stage(2,ground,query=raw['user_query']),max_refinements)
+    if not store(2,'backward_query',stage2): return result
+    query=stage2['output']['user_query']
+    def make_calls(attempt, instruction):
+        raw,_,usage=call_generator.generate(client,query,ground.candidate_tools,registry,ground.metadata.dataset_version,refinement=instruction)
+        return raw,usage
+    def check_calls(raw):
+        check=validators.validate_calls(raw,ground,registry)
+        critical={'format','x-ref','x-match','oneOf','anyOf','allOf'}
+        unresolved={c['name'] for c in check.checks if c.get('status')=='not_verified'} & critical
+        if unresolved:
+            return validators.feedback(3,[issue('UNSUPPORTED_SCHEMA_CONSTRAINT',','.join(sorted(unresolved)),retryable=False)])
+        return check
+    stage3=run_stage(3,make_calls,check_calls,
+                     lambda raw:verify_stage(3,ground,query=query,calls=raw['tool_calls']),max_refinements,redact_terms=ground.target_tools)
+    if not store(3,'forward_calls',stage3): return result
+    # Every preceding phase and every terminal deterministic/semantic decision must exist.
+    if not all(result['stage_history'].get(k) and result['stage_history'][k][-1].get('semantic',{}).get('passed') is True for k in ('ground_truth','backward_query','forward_calls')):
+        result['failure_reason']='incomplete_audit';return result
+    result['status']='verified_candidate'
+    return result
+
+def generate(train_data, registry, client, limit, seed, with_report=False, verifier=None, max_refinements=3):
     if not isinstance(train_data, TrainOnlyDataset): raise TypeError('verified TrainOnlyDataset required')
     if not 1 <= limit <= 10: raise ValueError('limit must be 1 to 10')
     records=list(train_data.iter_records())
@@ -85,7 +158,31 @@ def generate(train_data, registry, client, limit, seed, with_report=False):
                 scenario='simple'
         selected.append((record,scenario))
     train_queries={query_key(record['audio_text']) for record in records}
-    results=[run_attempt(record,registry,client,scenario,seed+i,train_queries) for i,(record,scenario) in enumerate(selected)]
+    metadata=None
+    if verifier is not None:
+        verifier_client=getattr(verifier,'client',None)
+        if verifier_client is None or getattr(verifier_client,'model',None) == getattr(client,'model',None):
+            raise ValueError('generator and verifier models must differ')
+        client.keep_alive=0
+        verifier_client.keep_alive=0
+        client.prompt_byte_limit=max(1,client.options["num_ctx"]-client.options["num_predict"]-256)
+        verifier_client.prompt_byte_limit=max(1,verifier_client.options["num_ctx"]-verifier_client.options["num_predict"]-256)
+        generator_digest=client.model_digest()
+        verifier_digest=verifier_client.model_digest()
+        if not generator_digest or not verifier_digest or generator_digest==verifier_digest:
+            raise ValueError('distinct local model digests required')
+        client.unload()
+        verifier_client.unload()
+        metadata={'generator':client.model,'generator_digest':generator_digest,'generator_options':client.options,
+                  'verifier':verifier_client.model,'verifier_digest':verifier_digest,'verifier_options':verifier_client.options,
+                  'generator_keep_alive':client.keep_alive,'verifier_keep_alive':verifier_client.keep_alive,'verifier_think':getattr(verifier_client,'think',None)}
+    results=[]
+    for i,(record,scenario) in enumerate(selected):
+        result=run_verified_attempt(record,registry,client,scenario,seed+i,train_queries,verifier,max_refinements,metadata) if verifier is not None else run_attempt(record,registry,client,scenario,seed+i,train_queries)
+        results.append(result)
+        if result.get('failure_reason')=='TransportError' or any(problem.get('error_code') in ('OUT_OF_MEMORY','TIMEOUT','TRANSPORT_FAILURE') for history in result.get('stage_history',{}).values() for step in history for problem in step.get('issues',[])):
+            break
+
     report={'requested':limit,'eligible':eligible,'attempted':len(results),
             'shortfall':max(0,limit-len(results)), 'excluded_by_reason':dict(sorted(excluded.items())),
             'multiple_fallbacks_by_reason':dict(sorted(fallbacks.items()))}

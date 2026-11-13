@@ -28,7 +28,7 @@ def sample(record, registry, scenario, seed):
     candidates=[target]
     if scenario == 'multiple':
         app=target.split('.',1)[0]
-        distractors=sorted(set(registry.list_tools(app=app)) & allowed - {target})
+        distractors=sorted(name for name in (set(registry.list_tools(app=app)) & allowed - {target}) if not unsupported_constraints(registry.get_schema(name)))
         if not distractors: raise ValueError('no_coherent_distractor')
         candidates.append(random.Random(seed).choice(distractors))
         random.Random(seed+1).shuffle(candidates)
