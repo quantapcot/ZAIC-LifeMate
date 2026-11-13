@@ -3,6 +3,7 @@ from collections import Counter
 import json
 import math
 import statistics
+from src.toolcall.evaluation.routing_diagnostics import aligned_recall
 
 
 def metrics(predictions, labels):
@@ -32,9 +33,11 @@ def metrics(predictions, labels):
     # Gold is consulted only here, after the inference stage. Candidate recall is
     # per gold call, against the union of candidate sets seen during that sample.
     hits = targets = first_hits = first_targets = premature = first_correct = wrong_selected = 0
+    aligned_hits=aligned_total=0
     stops = Counter(); taxonomy = Counter(); internal = sdk_rejects = proposed = candidate_counts = steps = 0
     for row in predictions:
         gold=labels[row['id']]['tool_calls']; trace=row.get('trace',[])
+        ah,at=aligned_recall(trace,gold);aligned_hits+=ah;aligned_total+=at
         seen=set(name for step in trace for name in step.get('candidate_tools',[]))
         first=set(trace[0].get('candidate_tools',[])) if trace else set()
         targets += len(gold); hits += sum(c['name'] in seen for c in gold)
@@ -58,5 +61,5 @@ def metrics(predictions, labels):
         if stop in ('REPEATED_INEFFECTIVE_CALL','PROMPT_BUDGET_EXCEEDED','MODEL_OUTPUT_FAILURE','STEP_LIMIT','TIMEOUT'): taxonomy[stop]+=1
     taxonomy['WRONG_TOOL_SELECTION_FIRST_WHEN_RETRIEVED']=wrong_selected
     taxonomy['PREMATURE_FINISH_COUNT_HEURISTIC']=premature
-    report.update(failure_taxonomy=dict(taxonomy),candidate_recall_union=div(hits,targets),candidate_miss_rate=div(targets-hits,targets),first_gold_tool_recall_initial=div(first_hits,first_targets),candidate_targets=targets,first_action_tool_accuracy=div(first_correct,first_targets),first_target_retrieved_but_other_tool_proposed=wrong_selected,average_candidates_per_step=div(candidate_counts,steps),internal_rejections=internal,sdk_rejections=sdk_rejects,model_proposals=proposed,invalid_proposal_rate=div(sum(r['invalid_proposals'] for r in predictions),proposed),stop_reasons=dict(stops),premature_finish_by_count=div(premature,n),model_calls_per_sample=div(sum(r.get('model_calls',0) for r in predictions),n),router_seconds_total=sum(r.get('router_seconds',0) for r in predictions),prompt_budget_failures=sum(r.get('error')=='prompt_budget' for r in predictions))
+    report.update(step_aligned_candidate_recall=div(aligned_hits,aligned_total),step_aligned_observations=aligned_total,failure_taxonomy=dict(taxonomy),candidate_recall_union=div(hits,targets),candidate_miss_rate=div(targets-hits,targets),first_gold_tool_recall_initial=div(first_hits,first_targets),candidate_targets=targets,first_action_tool_accuracy=div(first_correct,first_targets),first_target_retrieved_but_other_tool_proposed=wrong_selected,average_candidates_per_step=div(candidate_counts,steps),internal_rejections=internal,sdk_rejections=sdk_rejects,model_proposals=proposed,invalid_proposal_rate=div(sum(r['invalid_proposals'] for r in predictions),proposed),stop_reasons=dict(stops),premature_finish_by_count=div(premature,n),model_calls_per_sample=div(sum(r.get('model_calls',0) for r in predictions),n),router_seconds_total=sum(r.get('router_seconds',0) for r in predictions),prompt_budget_failures=sum(r.get('error')=='prompt_budget' for r in predictions))
     return report

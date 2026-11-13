@@ -75,7 +75,7 @@ class ActionAgent:
         ctx={k:context[k] for k in ('current_time','timezone','location','user_profile') if k in context}
         payload={'request':transcript,'context':ctx,'history':safe_history(history),'tools':[],'observations':[]}
         start=time.perf_counter(); model_time=tool_time=router_time=0.; tokens=invalid=sdk_checks=sdk_valid=execution_success=executions=model_calls=0
-        error=error_code=None; trace=[]; last_call=None; previous_candidates=None; offset=0; fallback_used=False; last_invalid=None
+        error=error_code=None; trace=[]; last_call=None; previous_candidates=None; offset=0; fallback_used=False; progress_retry=False; last_invalid=None; memory_compacted=False
         for step in range(self.max_steps):
             entry={'step':step+1,'internal_validation':'not_run','sdk_validation':'not_run','executed':False,'stop_reason':None}
             trace.append(entry); step_start=time.perf_counter()
@@ -98,7 +98,10 @@ class ActionAgent:
                 except PromptBudgetError as exc:
                     entry['prompt_budget']=exc.budget; entry['budget_compactions']+=1
                     if payload['history']: payload['history']=payload['history'][len(payload['history'])//2+1:];continue
-                    if len(payload['observations'])>2: payload['observations']=payload['observations'][-2:];continue
+                    if len(payload['observations'])>2 and not memory_compacted:
+                        # Retain a recent identifier-bearing result plus the latest observations.
+                        old=payload['observations'][:-2]; keep=next((x for x in reversed(old) if 'id' in json.dumps(x.get('result',{}),ensure_ascii=False).lower()),None)
+                        payload['observations']=([keep] if keep is not None else [])+payload['observations'][-2:];memory_compacted=True;continue
                     if len(payload['tools'])>4:
                         payload['tools']=[x for x in payload['tools'] if x['name']=='sys.ask_missing_info']+ [x for x in payload['tools'] if x['name']!='sys.ask_missing_info'][:3]
                         entry['candidate_tools']=[x['name'] for x in payload['tools']];entry['candidate_count']=len(payload['tools']);continue
@@ -110,6 +113,14 @@ class ActionAgent:
             entry.update(model_action=proposal.get('action'),proposed_tool=proposal.get('name'),proposed_arguments=proposal.get('arguments'),invalid_retry_count=invalid)
             if time.perf_counter()-start>=self.deadline_seconds: error='timeout';entry['stop_reason']='TIMEOUT';break
             if proposal.get('action')=='finish':
+                # A lookup-only or explicitly failed last action is grounded evidence to reconsider once.
+                last=payload['observations'][-1] if payload['observations'] else {}
+                last_name=str(last.get('tool','')).lower(); last_result=last.get('result')
+                lookup=any(word in last_name.split('.')[-1] for word in ('find','search','get','list','lookup','read'))
+                failed=isinstance(last_result,dict) and (last_result.get('ok') is False or last_result.get('done') is False)
+                if executions and not progress_retry and (lookup or failed):
+                    progress_retry=True;payload['observations'].append({'progress_check':'Review whether the lookup result or failed action leaves the user request incomplete. Finish if no supported action remains.'})
+                    entry['stop_reason']='PROGRESS_RECHECK';entry['latency_seconds']=time.perf_counter()-step_start;continue
                 # One bounded alternative retrieval only when unshown installed tools remain.
                 if not executions and not fallback_used and len(available)>len(candidates):
                     fallback_used=True;offset=self.router.top_k;entry['stop_reason']='FALLBACK_RETRIEVAL';entry['latency_seconds']=time.perf_counter()-step_start;continue
