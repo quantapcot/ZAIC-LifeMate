@@ -2,6 +2,7 @@
 import json
 import time
 import socket
+import math
 from urllib import error, request
 from urllib.parse import urlsplit
 
@@ -23,6 +24,12 @@ class InvalidModelOutput(ValueError):
         self.field = field
         self.raw_output = raw_output
 
+
+
+class PromptBudgetError(ValueError):
+    def __init__(self, budget):
+        super().__init__("PROMPT_TOO_LARGE")
+        self.budget = dict(budget)
 
 
 def _reject_constant(value):
@@ -60,7 +67,7 @@ class NoRedirect(request.HTTPRedirectHandler):
 
 class OllamaClient:
     def __init__(self, model=MODEL, base_url="http://127.0.0.1:11434", seed=42,
-                 temperature=0.1, context_length=4096, max_tokens=512, timeout=180, keep_alive=None, think=None):
+                 temperature=0.1, context_length=4096, max_tokens=512, timeout=180, keep_alive=None, think=None, max_payload_bytes=262144, token_estimate_factor=1.0, confirm_unloaded=False):
         url = urlsplit(base_url)
         if url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1") or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
             raise ValueError("Ollama URL must be a local HTTP origin")
@@ -72,7 +79,13 @@ class OllamaClient:
         self.timeout = timeout
         self.keep_alive = keep_alive
         self.think = think
-        self.prompt_byte_limit = None
+        self.confirm_unloaded = confirm_unloaded
+        if max_payload_bytes < 1024 or not math.isfinite(token_estimate_factor) or token_estimate_factor <= 0 or max_tokens + 128 >= context_length:
+            raise ValueError("invalid prompt budget configuration")
+        self.max_payload_bytes = max_payload_bytes
+        self.token_estimate_factor = token_estimate_factor
+        self.last_budget = None
+        self._model_digest = None
         self.opener = request.build_opener(request.ProxyHandler({}), NoRedirect())
 
     def model_digest(self):
@@ -81,10 +94,24 @@ class OllamaClient:
                 payload = json.loads(response.read(4 * 1024 * 1024))
             for item in payload.get("models", []):
                 if item.get("name") == self.model:
-                    return item.get("digest")
+                    self._model_digest = item.get("digest")
+                    return self._model_digest
         except (error.URLError, TimeoutError, OSError, ValueError, AttributeError):
             return None
         return None
+
+    def assert_unloaded(self):
+        """Fail closed if the server does not confirm that this model is unloaded."""
+        for _ in range(20):
+            try:
+                with self.opener.open(self.base_url + "/api/ps", timeout=self.timeout) as response:
+                    payload=json.loads(response.read(1024*1024))
+                if not isinstance(payload,dict) or not isinstance(payload.get('models'),list): raise ValueError()
+                if not any(m.get('name')==self.model or m.get('model')==self.model or (self._model_digest and m.get('digest')==self._model_digest) for m in payload['models']): return
+            except (error.URLError,TimeoutError,OSError,ValueError,TypeError,AttributeError) as exc:
+                raise TransportError('Unable to confirm model unload',code='UNLOAD_UNCONFIRMED') from exc
+            time.sleep(0.2)
+        raise TransportError('Model did not unload',code='UNLOAD_UNCONFIRMED')
 
     def unload(self):
         """Ask the local Ollama server to unload this exact model."""
@@ -93,6 +120,7 @@ class OllamaClient:
         try:
             with self.opener.open(req, timeout=self.timeout) as response:
                 response.read(1024 * 1024)
+            if self.confirm_unloaded: self.assert_unloaded()
         except (error.URLError, TimeoutError, OSError) as exc:
             raise TransportError("Ollama unload failed") from exc
 
@@ -102,13 +130,22 @@ class OllamaClient:
         if self.keep_alive is not None: payload["keep_alive"] = self.keep_alive
         if self.think is not None: payload["think"] = self.think
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        if self.prompt_byte_limit is not None and len(encoded) > self.prompt_byte_limit:
-            raise ValueError("PROMPT_TOO_LARGE")
+        # Conservative heuristic, not a tokenizer: count Unicode characters in messages
+        # and schema as at most one estimated token each, plus fixed chat overhead.
+        prompt_content = json.dumps({"messages":payload["messages"],"format":output_schema},ensure_ascii=False,separators=(",",":"))
+        estimated = math.ceil(len(prompt_content) * self.token_estimate_factor) + 128
+        available = self.options['num_ctx'] - self.options['num_predict']
+        self.last_budget = {"estimated_input_tokens":estimated,"reserved_output_tokens":self.options['num_predict'],
+                            "context_tokens":self.options['num_ctx'],"payload_bytes":len(encoded),
+                            "max_payload_bytes":self.max_payload_bytes,"estimation":"unicode_codepoints_plus_overhead"}
+        if len(encoded) > self.max_payload_bytes or estimated > available:
+            raise PromptBudgetError(self.last_budget)
         req = request.Request(self.base_url + "/api/chat", data=encoded, headers={"Content-Type": "application/json"}, method="POST")
         start = time.perf_counter()
         try:
             with self.opener.open(req, timeout=self.timeout) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)
+            if self.confirm_unloaded and self.keep_alive == 0: self.assert_unloaded()
             if len(raw) > 4 * 1024 * 1024: raise InvalidModelOutput("response exceeds limit", code="RESPONSE_TOO_LARGE")
         except error.HTTPError as exc:
             try:
@@ -139,4 +176,4 @@ class OllamaClient:
         except InvalidModelOutput as exc:
             exc.raw_output = content[:4096]
             raise
-        return result, {"latency_seconds": elapsed, "prompt_tokens": envelope.get('prompt_eval_count'), "output_tokens": envelope.get('eval_count'), "model": self.model, "options": dict(self.options)}
+        return result, {"latency_seconds": elapsed, "prompt_tokens": envelope.get('prompt_eval_count'), "output_tokens": envelope.get('eval_count'), "model": self.model, "options": dict(self.options), "input_budget": dict(self.last_budget)}

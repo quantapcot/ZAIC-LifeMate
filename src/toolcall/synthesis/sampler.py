@@ -11,7 +11,7 @@ class UnsupportedSchema(ValueError):
         super().__init__(issues[0]['code'])
 
 
-def sample(record, registry, scenario, seed):
+def sample(record, registry, scenario, seed, excluded_signatures=()):
     if scenario not in ('simple','multiple'):
         raise ValueError('unsupported_scenario')
     calls=record['label']['tool_calls']
@@ -30,6 +30,15 @@ def sample(record, registry, scenario, seed):
         app=target.split('.',1)[0]
         distractors=sorted(name for name in (set(registry.list_tools(app=app)) & allowed - {target}) if not unsupported_constraints(registry.get_schema(name)))
         if not distractors: raise ValueError('no_coherent_distractor')
-        candidates.append(random.Random(seed).choice(distractors))
+        first=random.Random(seed).choice(distractors)
+        rest=[name for name in distractors if name != first]
+        random.Random(seed).shuffle(rest)
+        distractors=[first]+rest
+        excluded={tuple(sorted(signature)) for signature in excluded_signatures}
+        alternatives=[name for name in distractors if tuple(sorted((target,name))) not in excluded]
+        if not alternatives: raise ValueError('no_alternative_distractor')
+        candidates.append(alternatives[0])
         random.Random(seed+1).shuffle(candidates)
+    elif tuple(sorted(candidates)) in {tuple(sorted(signature)) for signature in excluded_signatures}:
+        raise ValueError('no_alternative_ground_truth')
     return GroundTruth(scenario,candidates,[target],Metadata(str(registry.version),'train_split','pending'))

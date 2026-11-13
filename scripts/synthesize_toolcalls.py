@@ -113,6 +113,8 @@ def main():
     parser.add_argument('--context-length',type=int,default=4096)
     parser.add_argument('--max-tokens',type=int,default=512)
     parser.add_argument('--timeout',type=float,default=180)
+    parser.add_argument('--max-payload-bytes',type=int,default=262144)
+    parser.add_argument('--token-estimate-factor',type=float,default=1.0)
     parser.add_argument('--verify',action='store_true',help='enable separate development-only semantic verifier')
     parser.add_argument('--verifier-model',default='qwen3:8b-q4_K_M')
     parser.add_argument('--max-refinements',type=int,default=3)
@@ -121,8 +123,8 @@ def main():
     if not 0 <= args.max_refinements <= 3: parser.error('max-refinements must be between 0 and 3')
     if args.verify and args.model == args.verifier_model: parser.error('verifier and generator models must differ')
     try:
-        client=OllamaClient(model=args.model,base_url=args.base_url,seed=args.seed,context_length=args.context_length,max_tokens=args.max_tokens,timeout=args.timeout,keep_alive=0 if args.verify else None)
-        verifier_client=OllamaClient(model=args.verifier_model,base_url=args.base_url,seed=args.seed,temperature=0,context_length=args.context_length,max_tokens=args.max_tokens,timeout=args.timeout,keep_alive=0,think=False) if args.verify else None
+        client=OllamaClient(model=args.model,base_url=args.base_url,seed=args.seed,context_length=args.context_length,max_tokens=args.max_tokens,timeout=args.timeout,keep_alive=0 if args.verify else None,max_payload_bytes=args.max_payload_bytes,token_estimate_factor=args.token_estimate_factor,confirm_unloaded=args.verify)
+        verifier_client=OllamaClient(model=args.verifier_model,base_url=args.base_url,seed=args.seed,temperature=0,context_length=args.context_length,max_tokens=args.max_tokens,timeout=args.timeout,keep_alive=0,think=False,max_payload_bytes=args.max_payload_bytes,token_estimate_factor=args.token_estimate_factor,confirm_unloaded=True) if args.verify else None
         registry=ToolRegistry.from_catalog(args.train_dir/'train_tools_catalog.json')
         train=TrainOnlyDataset.from_prepared_split(args.train_dir/'train.jsonl',args.train_dir/'train_tools_catalog.json',args.splits_dir)
         if args.dry_run:

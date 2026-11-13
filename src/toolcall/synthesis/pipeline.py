@@ -1,5 +1,6 @@
 """Three bounded stages; validation is preliminary and has no side effects."""
 import random
+import copy
 import time
 from dataclasses import asdict
 from collections import Counter
@@ -39,11 +40,13 @@ def run_attempt(record, registry, client, scenario, seed, training_queries=froze
         result['stages']['backward_query']={'output':asdict(query),'model_output':raw,'validation':asdict(check),'usage':usage,'latency_seconds':usage['latency_seconds']}
         if not check.valid: raise ValueError('invalid_query')
     except (TransportError,InvalidModelOutput,ValueError) as exc:
-        result['failure_stage']=2;result['failure_reason']=type(exc).__name__ if isinstance(exc,(TransportError,InvalidModelOutput)) else 'invalid_query'
+        result['failure_stage']=2;result['failure_reason']=type(exc).__name__ if isinstance(exc,(TransportError,InvalidModelOutput)) else ('PROMPT_TOO_LARGE' if hasattr(exc,'budget') else 'invalid_query')
         if isinstance(exc,(TransportError,InvalidModelOutput)):
             item=issue(exc.code,exc.field,source='transport' if isinstance(exc,TransportError) else 'model_output',retryable=isinstance(exc,InvalidModelOutput))
             result['feedback']=asdict(validators.feedback(2,[item],('semantic_alignment','argument_grounding')))
             if exc.raw_output is not None: result['local_invalid_output_excerpt']=exc.raw_output
+        elif hasattr(exc,'budget'):
+            result['input_budget']=exc.budget;result['feedback']=asdict(validators.feedback(2,[issue('PROMPT_TOO_LARGE','request',source='generation_input',retryable=False)]))
         else: result['feedback']=result['stages'].get('backward_query',{}).get('validation',asdict(validators.feedback(2,[issue('OUTPUT_SCHEMA_MISMATCH','response',source='model_output')])))
         return result
     try:
@@ -52,11 +55,13 @@ def run_attempt(record, registry, client, scenario, seed, training_queries=froze
         result['stages']['forward_calls']={'output':asdict(calls) if calls else None,'model_output':raw,'validation':asdict(check),'usage':usage,'latency_seconds':usage['latency_seconds']}
         if not check.valid: raise ValueError('invalid_calls')
     except (TransportError,InvalidModelOutput,ValueError) as exc:
-        result['failure_stage']=3;result['failure_reason']=type(exc).__name__ if isinstance(exc,(TransportError,InvalidModelOutput)) else 'invalid_calls'
+        result['failure_stage']=3;result['failure_reason']=type(exc).__name__ if isinstance(exc,(TransportError,InvalidModelOutput)) else ('PROMPT_TOO_LARGE' if hasattr(exc,'budget') else 'invalid_calls')
         if isinstance(exc,(TransportError,InvalidModelOutput)):
             item=issue(exc.code,exc.field,source='transport' if isinstance(exc,TransportError) else 'model_output',retryable=isinstance(exc,InvalidModelOutput))
             result['feedback']=asdict(validators.feedback(3,[item],('semantic_alignment','argument_grounding')))
             if exc.raw_output is not None: result['local_invalid_output_excerpt']=exc.raw_output
+        elif hasattr(exc,'budget'):
+            result['input_budget']=exc.budget;result['feedback']=asdict(validators.feedback(3,[issue('PROMPT_TOO_LARGE','request',source='generation_input',retryable=False)]))
         else: result['feedback']=result['stages'].get('forward_calls',{}).get('validation',asdict(validators.feedback(3,[issue('OUTPUT_SCHEMA_MISMATCH','response',source='model_output')])))
         return result
     result['status']='provisional'
@@ -64,7 +69,7 @@ def run_attempt(record, registry, client, scenario, seed, training_queries=froze
 
 
 
-def run_verified_attempt(record, registry, client, scenario, seed, training_queries, verifier, max_refinements=3, model_metadata=None):
+def run_verified_attempt(record, registry, client, scenario, seed, training_queries, verifier, max_refinements=3, model_metadata=None, initial_candidate=None):
     if verifier is None: raise ValueError('semantic verifier required')
     required=('generator','generator_digest','verifier','verifier_digest')
     if not isinstance(model_metadata,dict) or not all(isinstance(model_metadata.get(k),str) and model_metadata[k] for k in required) or model_metadata['generator_digest']==model_metadata['verifier_digest']:
@@ -92,16 +97,41 @@ def run_verified_attempt(record, registry, client, scenario, seed, training_quer
         decision['issues']=sorted(set(decision.get('issues',[])) | set(policy_issues))
         decision['passed']=decision.get('passed') is True and not decision['issues']
         return decision
+    attempted_signatures=[]
+    frozen_stages=initial_candidate.get('stages',{}) if initial_candidate is not None else {}
+    frozen_ground=frozen_stages.get('ground_truth',{}).get('output')
+    if initial_candidate is not None:
+        expected=asdict(sampler.sample(record,registry,scenario,seed))
+        if frozen_ground != expected: raise ValueError('frozen ground truth does not match selected scenario')
     def make_ground(attempt, instruction):
-        ground=sampler.sample(record,registry,scenario,seed+attempt)
-        return asdict(ground),{'model':'deterministic_sampler','attempt':attempt}
+        if attempt==0 and initial_candidate is not None:
+            raw=copy.deepcopy(frozen_ground)
+            attempted_signatures.append(tuple(sorted(raw['candidate_tools'])))
+            return raw,{'model':'deterministic_sampler','attempt':0,'reused_initial':True}
+        ground=sampler.sample(record,registry,scenario,seed,excluded_signatures=attempted_signatures)
+        attempted_signatures.append(tuple(sorted(ground.candidate_tools)))
+        return asdict(ground),{'model':'deterministic_sampler','attempt':attempt,'selection_reason':'initial' if not attempt else 'replace_rejected_distractor'}
+    def can_refine_ground(history):
+        if scenario != 'multiple': return False,'invariant_simple_target'
+        semantic=history[-1].get('semantic') or {}
+        checks=(semantic.get('verdict') or {}).get('checks',[])
+        failed=[c for c in checks if c.get('status')!='pass']
+        if not failed or any(c.get('name')!='distractor_relevance' for c in failed):
+            return False,'feedback_not_correctable_by_distractor_change'
+        try: sampler.sample(record,registry,scenario,seed,excluded_signatures=attempted_signatures)
+        except ValueError: return False,'no_alternative_distractor'
+        return True,'replace_rejected_distractor'
     def ground_from(raw):
         return GroundTruth(raw['scenario_type'],raw['candidate_tools'],raw['target_tools'],Metadata(**raw['metadata']))
     stage1=run_stage(1,make_ground,lambda raw:validators.validate_ground(ground_from(raw),registry),
-                     lambda raw:verify_stage(1,ground_from(raw)),max_refinements)
+                     lambda raw:verify_stage(1,ground_from(raw)),max_refinements,can_refine=can_refine_ground)
     if not store(1,'ground_truth',stage1): return result
     ground=ground_from(stage1['output'])
     def make_query(attempt, instruction):
+        if attempt==0 and initial_candidate is not None and asdict(ground)==frozen_ground:
+            original=frozen_stages.get('backward_query')
+            if not original or 'model_output' not in original: raise ValueError('FROZEN_INITIAL_QUERY_UNAVAILABLE')
+            return copy.deepcopy(original['model_output']),{'reused_initial':True,'original_usage':copy.deepcopy(original.get('usage',{}))}
         raw,_,usage=query_generator.generate(client,ground,registry,refinement=instruction)
         return raw,usage
     def check_query(raw):
@@ -114,6 +144,11 @@ def run_verified_attempt(record, registry, client, scenario, seed, training_quer
     if not store(2,'backward_query',stage2): return result
     query=stage2['output']['user_query']
     def make_calls(attempt, instruction):
+        original_query=frozen_stages.get('backward_query',{}).get('model_output',{}).get('user_query')
+        if attempt==0 and initial_candidate is not None and asdict(ground)==frozen_ground and query==original_query:
+            original=frozen_stages.get('forward_calls')
+            if not original or 'model_output' not in original: raise ValueError('FROZEN_INITIAL_CALLS_UNAVAILABLE')
+            return copy.deepcopy(original['model_output']),{'reused_initial':True,'original_usage':copy.deepcopy(original.get('usage',{}))}
         raw,_,usage=call_generator.generate(client,query,ground.candidate_tools,registry,ground.metadata.dataset_version,refinement=instruction)
         return raw,usage
     def check_calls(raw):
@@ -132,7 +167,7 @@ def run_verified_attempt(record, registry, client, scenario, seed, training_quer
     result['status']='verified_candidate'
     return result
 
-def generate(train_data, registry, client, limit, seed, with_report=False, verifier=None, max_refinements=3):
+def select_scenarios(train_data, registry, limit, seed):
     if not isinstance(train_data, TrainOnlyDataset): raise TypeError('verified TrainOnlyDataset required')
     if not 1 <= limit <= 10: raise ValueError('limit must be 1 to 10')
     records=list(train_data.iter_records())
@@ -157,6 +192,11 @@ def generate(train_data, registry, client, limit, seed, with_report=False, verif
                 fallbacks[str(exc)] += 1
                 scenario='simple'
         selected.append((record,scenario))
+    return records,selected,eligible,excluded,fallbacks
+
+
+def generate(train_data, registry, client, limit, seed, with_report=False, verifier=None, max_refinements=3):
+    records,selected,eligible,excluded,fallbacks=select_scenarios(train_data,registry,limit,seed)
     train_queries={query_key(record['audio_text']) for record in records}
     metadata=None
     if verifier is not None:
@@ -165,8 +205,8 @@ def generate(train_data, registry, client, limit, seed, with_report=False, verif
             raise ValueError('generator and verifier models must differ')
         client.keep_alive=0
         verifier_client.keep_alive=0
-        client.prompt_byte_limit=max(1,client.options["num_ctx"]-client.options["num_predict"]-256)
-        verifier_client.prompt_byte_limit=max(1,verifier_client.options["num_ctx"]-verifier_client.options["num_predict"]-256)
+        client.confirm_unloaded=True
+        verifier_client.confirm_unloaded=True
         generator_digest=client.model_digest()
         verifier_digest=verifier_client.model_digest()
         if not generator_digest or not verifier_digest or generator_digest==verifier_digest:
@@ -180,7 +220,7 @@ def generate(train_data, registry, client, limit, seed, with_report=False, verif
     for i,(record,scenario) in enumerate(selected):
         result=run_verified_attempt(record,registry,client,scenario,seed+i,train_queries,verifier,max_refinements,metadata) if verifier is not None else run_attempt(record,registry,client,scenario,seed+i,train_queries)
         results.append(result)
-        if result.get('failure_reason')=='TransportError' or any(problem.get('error_code') in ('OUT_OF_MEMORY','TIMEOUT','TRANSPORT_FAILURE') for history in result.get('stage_history',{}).values() for step in history for problem in step.get('issues',[])):
+        if result.get('failure_reason') in ('TransportError','PROMPT_TOO_LARGE') or any(problem.get('error_code') in ('OUT_OF_MEMORY','TIMEOUT','TRANSPORT_FAILURE','UNLOAD_UNCONFIRMED') for history in result.get('stage_history',{}).values() for step in history for problem in step.get('issues',[])):
             break
 
     report={'requested':limit,'eligible':eligible,'attempted':len(results),

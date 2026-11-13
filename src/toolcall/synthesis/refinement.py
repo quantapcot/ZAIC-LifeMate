@@ -8,7 +8,7 @@ from src.toolcall.llm import TransportError, InvalidModelOutput
 MAX_REFINEMENTS=3
 
 
-def run_stage(stage, producer, deterministic, semantic, max_refinements=3, redact_terms=()):
+def run_stage(stage, producer, deterministic, semantic, max_refinements=3, redact_terms=(), can_refine=None):
     if type(max_refinements) is not int or not 0 <= max_refinements <= MAX_REFINEMENTS:
         raise ValueError('max_refinements must be between 0 and 3')
     if semantic is None: raise ValueError('semantic verifier required')
@@ -46,6 +46,7 @@ def run_stage(stage, producer, deterministic, semantic, max_refinements=3, redac
             continue
         except ValueError as exc:
             entry['issues']=[{'error_code':str(exc),'source':'sampler' if stage==1 else 'generation_input','retryable':False}]
+            if hasattr(exc,'budget'): entry['input_budget']=exc.budget
             entry['latency_seconds']=time.perf_counter()-start;history.append(entry);break
         check=deterministic(output)
         entry['deterministic']=asdict(check)
@@ -53,6 +54,9 @@ def run_stage(stage, producer, deterministic, semantic, max_refinements=3, redac
             entry['issues']=check.issues
             entry['latency_seconds']=time.perf_counter()-start;history.append(entry)
             if not check.issues or not all(x.get('retryable',False) for x in check.issues): break
+            if can_refine is not None:
+                allowed,reason=can_refine(history)
+                if not allowed: history[-1]['stop_reason']=reason;break
             continue
         try:
             decision=semantic(output)
@@ -74,4 +78,7 @@ def run_stage(stage, producer, deterministic, semantic, max_refinements=3, redac
         if decision.get('verdict',{}).get('verdict')=='uncertain':
             return {'status':'manual_review_required','output':None,'history':history,'refinements':attempt}
         if not entry['issues']: break
+        if can_refine is not None:
+            allowed,reason=can_refine(history)
+            if not allowed: history[-1]['stop_reason']=reason;break
     return {'status':'rejected','output':None,'history':history,'refinements':max(0,len(history)-1)}
